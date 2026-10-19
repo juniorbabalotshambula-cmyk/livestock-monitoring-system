@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
@@ -11,6 +13,27 @@ const PORT = 5000;
 const LITERATURE_TEMP_THRESHOLD = 39.5;
 const MIN_READINGS_FOR_ADAPTIVE = 5;
 const MIN_READINGS_FOR_GEOFENCE = 10;
+
+const THINGSPEAK_CHANNEL_ID = process.env.THINGSPEAK_CHANNEL_ID;
+const THINGSPEAK_READ_API_KEY = process.env.THINGSPEAK_READ_API_KEY;
+const THINGSPEAK_POLL_INTERVAL_MS = 20000;
+const fs = require('fs');
+const CURSOR_FILE = './.thingspeak-cursor.json';
+
+function loadCursor() {
+  try {
+    const data = JSON.parse(fs.readFileSync(CURSOR_FILE, 'utf8'));
+    return data.lastProcessedEntryId || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function saveCursor(id) {
+  fs.writeFileSync(CURSOR_FILE, JSON.stringify({ lastProcessedEntryId: id }));
+}
+
+let lastProcessedEntryId = loadCursor();
 
 app.get('/', (req, res) => {
   res.json({ message: 'Livestock monitoring backend is running!' });
@@ -67,6 +90,47 @@ async function getGeofenceBounds(animalId) {
   return { established: false, basedOnReadings: priorReadings.length };
 }
 
+// ---------- Shared creation logic (used by both the API routes and the ThingSpeak poller) ----------
+async function createGpsReading(animalId, latitude, longitude) {
+  const bounds = await getGeofenceBounds(animalId);
+
+  let outsideFence = false;
+  if (bounds.established) {
+    outsideFence =
+      latitude < bounds.latLow ||
+      latitude > bounds.latHigh ||
+      longitude < bounds.lonLow ||
+      longitude > bounds.lonHigh;
+  }
+
+  const reading = await prisma.gpsReading.create({
+    data: { animalId, latitude, longitude, outsideFence },
+  });
+
+  return {
+    reading,
+    geofenceStatus: bounds.established
+      ? `Checked against this animal's own geo-fence (built from ${bounds.basedOnReadings} prior readings).`
+      : `Geo-fence not yet established (needs ${MIN_READINGS_FOR_GEOFENCE} readings, has ${bounds.basedOnReadings}). Marked inside fence by default.`,
+  };
+}
+
+async function createHealthReading(animalId, temperatureC) {
+  const { threshold, method, basedOnReadings } = await getTemperatureThreshold(animalId);
+  const alertFlag = temperatureC > threshold;
+
+  const reading = await prisma.healthReading.create({
+    data: { animalId, temperatureC, alert: alertFlag },
+  });
+
+  return {
+    reading,
+    thresholdUsed: Number(threshold.toFixed(2)),
+    thresholdMethod: method,
+    basedOnReadings,
+  };
+}
+
 // ================= ANIMALS =================
 app.get('/animals', async (req, res) => {
   const animals = await prisma.animal.findMany();
@@ -95,32 +159,12 @@ app.get('/gps-readings', async (req, res) => {
 
 app.post('/gps-readings', async (req, res) => {
   const { animalId, latitude, longitude } = req.body;
-  const bounds = await getGeofenceBounds(Number(animalId));
-
-  let outsideFence = false;
-  if (bounds.established) {
-    outsideFence =
-      latitude < bounds.latLow ||
-      latitude > bounds.latHigh ||
-      longitude < bounds.lonLow ||
-      longitude > bounds.lonHigh;
-  }
-
-  const reading = await prisma.gpsReading.create({
-    data: {
-      animalId: Number(animalId),
-      latitude: Number(latitude),
-      longitude: Number(longitude),
-      outsideFence,
-    },
-  });
-
-  res.status(201).json({
-    ...reading,
-    geofenceStatus: bounds.established
-      ? `Checked against this animal's own geo-fence (built from ${bounds.basedOnReadings} prior readings).`
-      : `Geo-fence not yet established (needs ${MIN_READINGS_FOR_GEOFENCE} readings, has ${bounds.basedOnReadings}). Marked inside fence by default.`,
-  });
+  const { reading, geofenceStatus } = await createGpsReading(
+    Number(animalId),
+    Number(latitude),
+    Number(longitude)
+  );
+  res.status(201).json({ ...reading, geofenceStatus });
 });
 
 // ================= HEALTH READINGS =================
@@ -133,31 +177,14 @@ app.get('/health-readings', async (req, res) => {
 
 app.post('/health-readings', async (req, res) => {
   const { animalId, temperatureC } = req.body;
-  const { threshold, method, basedOnReadings } = await getTemperatureThreshold(
-    Number(animalId)
-  );
-
-  const alertFlag = Number(temperatureC) > threshold;
-
-  const reading = await prisma.healthReading.create({
-    data: {
-      animalId: Number(animalId),
-      temperatureC: Number(temperatureC),
-      alert: alertFlag,
-    },
-  });
-
-  res.status(201).json({
-    ...reading,
-    thresholdUsed: Number(threshold.toFixed(2)),
-    thresholdMethod: method,
-    basedOnReadings,
-  });
+  const { reading, thresholdUsed, thresholdMethod, basedOnReadings } =
+    await createHealthReading(Number(animalId), Number(temperatureC));
+  res.status(201).json({ ...reading, thresholdUsed, thresholdMethod, basedOnReadings });
 });
+
 // ================= ALERTS SUMMARY =================
 app.get('/alerts', async (req, res) => {
   const animals = await prisma.animal.findMany();
-
   const alerts = [];
 
   for (const animal of animals) {
@@ -194,6 +221,61 @@ app.get('/alerts', async (req, res) => {
   res.json(alerts);
 });
 
+// ================= THINGSPEAK IOT POLLER =================
+async function pollThingSpeak() {
+  if (!THINGSPEAK_CHANNEL_ID || !THINGSPEAK_READ_API_KEY) {
+    console.log('ThingSpeak not configured — skipping poll.');
+    return;
+  }
+
+  try {
+    const url = `https://api.thingspeak.com/channels/${THINGSPEAK_CHANNEL_ID}/feeds.json?api_key=${THINGSPEAK_READ_API_KEY}&results=20`;
+    const res = await fetch(url);
+    const data = await res.json();
+
+    const newEntries = (data.feeds || []).filter(
+      (f) => f.entry_id > lastProcessedEntryId
+    );
+
+    for (const entry of newEntries) {
+      const animalId = parseInt(entry.field1, 10);
+      const latitude = parseFloat(entry.field2);
+      const longitude = parseFloat(entry.field3);
+      const temperatureC = parseFloat(entry.field4);
+
+      if (!animalId || isNaN(latitude) || isNaN(longitude) || isNaN(temperatureC)) {
+        continue; // skip incomplete entries
+      }
+
+      const animalExists = await prisma.animal.findUnique({ where: { id: animalId } });
+      if (!animalExists) {
+        console.log(`ThingSpeak entry #${entry.entry_id}: unknown animalId ${animalId}, skipped.`);
+        continue;
+      }
+
+      const gpsResult = await createGpsReading(animalId, latitude, longitude);
+      const healthResult = await createHealthReading(animalId, temperatureC);
+
+      console.log(
+        `[ThingSpeak] entry #${entry.entry_id} -> animal ${animalId}: ` +
+        `GPS ${gpsResult.reading.outsideFence ? 'OUTSIDE FENCE' : 'ok'}, ` +
+        `temp ${temperatureC}°C ${healthResult.reading.alert ? 'ALERT' : 'ok'} ` +
+        `(${healthResult.thresholdMethod} threshold ${healthResult.thresholdUsed}°C)`
+      );
+
+            lastProcessedEntryId = entry.entry_id;
+      saveCursor(lastProcessedEntryId);
+    }
+  } catch (err) {
+    console.error('ThingSpeak poll failed:', err.message);
+  }
+}
+
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
+  if (THINGSPEAK_CHANNEL_ID && THINGSPEAK_READ_API_KEY) {
+    console.log(`Polling ThingSpeak channel ${THINGSPEAK_CHANNEL_ID} every ${THINGSPEAK_POLL_INTERVAL_MS / 1000}s...`);
+    setInterval(pollThingSpeak, THINGSPEAK_POLL_INTERVAL_MS);
+    pollThingSpeak(); // run once immediately on startup
+  }
 });

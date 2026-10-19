@@ -62,8 +62,10 @@ export default function App() {
   };
 
   useEffect(() => {
-    fetchAll();
-  }, []);
+  fetchAll();
+  const interval = setInterval(fetchAll, 15000); // refresh every 15 seconds
+  return () => clearInterval(interval);
+}, []);
 
   const tagFor = (id) => animals.find((a) => a.id === id)?.tagNumber || `#${id}`;
 
